@@ -1,0 +1,12 @@
+{
+  "name": "chrome-cdp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node start-chrome.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}
