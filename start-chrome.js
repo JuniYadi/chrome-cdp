@@ -45,6 +45,16 @@ function launchBrowser(executablePath, profileDir, port, background) {
     '--remote-allow-origins=*',
     '--no-first-run',
     '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-client-side-phishing-detection',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-sync',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--password-store=basic',
+    '--use-mock-keychain',
   ];
   const child = spawn(executablePath, args, {
     detached: background,
