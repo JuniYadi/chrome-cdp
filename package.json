@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node start-chrome.js",
+    "clean": "pkill -f \"Google Chrome for Testing\"",
     "test": "node --test"
   },
   "dependencies": {
