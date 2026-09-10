@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import net from 'node:net';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { execSync } from 'node:child_process';
 
 /**
@@ -70,7 +71,12 @@ export function createProxy(tailscaleIP, port, targetHost = '127.0.0.1', targetP
 }
 
 // CLI execution
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'))) {
+const isMain = process.argv[1] && (
+  import.meta.url === pathToFileURL(process.argv[1]).href ||
+  import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'))
+);
+
+if (isMain) {
   const args = process.argv.slice(2);
   const ports = args.map(Number).filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535);
 

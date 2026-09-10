@@ -33,8 +33,8 @@ function Get-ConfiguredPorts {
     if (Test-Path $ConfigFile) {
         try {
             $content = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-            if ($content -is [array]) {
-                return [int[]]$content
+            if ($null -ne $content) {
+                return @([int[]]$content)
             }
         } catch {}
     }
@@ -43,7 +43,7 @@ function Get-ConfiguredPorts {
 
 function Save-ConfiguredPorts {
     param([int[]]$ports)
-    $unique = $ports | Sort-Object -Unique
+    $unique = @($ports | Sort-Object -Unique)
     $json = $unique | ConvertTo-Json
     Set-Content -Path $ConfigFile -Value $json -Encoding utf8
 }
@@ -111,14 +111,16 @@ function Start-ProxyService {
     $portArgs = $ports -join " "
     Write-Host "[*] Menjalankan Secure Proxy untuk port: $portArgs..." -ForegroundColor Cyan
 
+    $argList = @($ProxyScript) + ($ports | ForEach-Object { "$_" })
+
     $proc = Start-Process -FilePath "node" `
-        -ArgumentList "`"$ProxyScript`" $portArgs" `
+        -ArgumentList $argList `
         -WindowStyle Hidden `
         -PassThru
 
     Start-Sleep -Seconds 1
     if ($proc -and -not $proc.HasExited) {
-        Write-Host "[+] Secure Proxy aktif di background (PID: $($proc.Id))." -ForegroundColor Green
+        Write-Host "[+] Secure Proxy aktif di background (PID: $($proc.Id)) melayani port: $portArgs." -ForegroundColor Green
     } else {
         Write-Host "[!] Gagal menjalankan proxy di background. Coba jalankan secara manual: node tailscale-proxy.js $portArgs" -ForegroundColor Red
     }
@@ -180,38 +182,47 @@ function Add-PortProxyRule {
     }
 
     Write-Host ""
-    $portInput = Read-Host "Masukkan Port CDP yang ingin dibuka ke Tailscale (contoh: 9222)"
-    $port = 0
-    if (-not [int]::TryParse($portInput, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
-        Write-Host "[!] Port tidak valid." -ForegroundColor Red
+    $portInput = Read-Host "Masukkan Port CDP yang ingin dibuka (bisa multi port, contoh: 9222, 9223)"
+    $rawPorts = $portInput -split "[\s,]+" | Where-Object { $_ -ne "" }
+    $validPorts = @()
+
+    foreach ($pStr in $rawPorts) {
+        $p = 0
+        if ([int]::TryParse($pStr, [ref]$p) -and $p -ge 1 -and $p -le 65535) {
+            $validPorts += $p
+        }
+    }
+
+    if ($validPorts.Count -eq 0) {
+        Write-Host "[!] Tidak ada port valid yang dimasukkan." -ForegroundColor Red
         Start-Sleep -Seconds 2
         return
     }
 
-    $ports = Get-ConfiguredPorts
-    if ($ports -notcontains $port) {
-        $ports += $port
-        Save-ConfiguredPorts $ports
+    $currentPorts = Get-ConfiguredPorts
+    $mergedPorts = @($currentPorts + $validPorts | Sort-Object -Unique)
+    Save-ConfiguredPorts $mergedPorts
+
+    foreach ($port in $validPorts) {
+        # Buka firewall khusus untuk Tailscale Subnet
+        $ruleName = "Tailscale-CDP-$port"
+        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+        New-NetFirewallRule `
+            -DisplayName $ruleName `
+            -Description "Allow CDP access via Tailscale only for port $port" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort $port `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any | Out-Null
     }
 
-    # Buka firewall khusus untuk Tailscale Subnet
-    $ruleName = "Tailscale-CDP-$port"
-    Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-    New-NetFirewallRule `
-        -DisplayName $ruleName `
-        -Description "Allow CDP access via Tailscale only for port $port" `
-        -Direction Inbound `
-        -Protocol TCP `
-        -LocalPort $port `
-        -RemoteAddress "100.64.0.0/10" `
-        -Action Allow `
-        -Profile Any | Out-Null
+    # Restart proxy dengan semua port yang dikonfigurasi
+    Start-ProxyService -ports $mergedPorts
 
-    # Restart proxy dengan port baru
-    Start-ProxyService -ports $ports
-
-    Write-Host "`n[+] BERHASIL: Port $port telah di-bind ke ${tsIP}:${port}." -ForegroundColor Green
-    Write-Host "    Akses dari device lain di Tailscale: http://${tsIP}:${port}" -ForegroundColor Yellow
+    Write-Host "`n[+] BERHASIL: Port $(($mergedPorts -join ', ')) telah aktif di ${tsIP}." -ForegroundColor Green
+    Write-Host "    Akses dari device lain di Tailscale: http://${tsIP}:<port>" -ForegroundColor Yellow
     Write-Host "    Public IP terisolasi total (0% leak)." -ForegroundColor Green
     Write-Host ""
     Pause
