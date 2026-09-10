@@ -210,7 +210,7 @@ function Add-PortProxyRule {
     # Restart proxy dengan port baru
     Start-ProxyService -ports $ports
 
-    Write-Host "`n[+] BERHASIL: Port $port telah di-bind ke $tsIP:$port." -ForegroundColor Green
+    Write-Host "`n[+] BERHASIL: Port $port telah di-bind ke ${tsIP}:${port}." -ForegroundColor Green
     Write-Host "    Akses dari device lain di Tailscale: http://${tsIP}:${port}" -ForegroundColor Yellow
     Write-Host "    Public IP terisolasi total (0% leak)." -ForegroundColor Green
     Write-Host ""
