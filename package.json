@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node start-chrome.js",
     "clean": "pkill -f \"Google Chrome for Testing\"",
+    "proxy:tailscale": "node tailscale-proxy.js",
     "manage:tailscale": "powershell -ExecutionPolicy Bypass -File ./manage-cdp-tailscale.ps1",
     "test": "node --test"
   },

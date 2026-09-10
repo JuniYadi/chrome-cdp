@@ -3,15 +3,18 @@
     Interactive Manager for exposing Chrome CDP securely over Tailscale in Windows.
 
 .DESCRIPTION
-    Safely bridges Chrome instances running on 127.0.0.1 to Tailscale IPv4 using
-    Windows PortProxy (netsh) and Windows Defender Firewall rules restricted to the Tailscale subnet.
-    Ensures Public IP remains completely closed to Chrome CDP.
+    Safely bridges Chrome instances running on 127.0.0.1 strictly to Tailscale IPv4 using
+    a dedicated user-space TCP proxy (tailscale-proxy.js) and Windows Defender Firewall.
+    Guarantees that Public IP is NEVER exposed (socket is bound only to Tailscale IP).
 
 .NOTES
     Must be run as Administrator (Elevated PowerShell).
 #>
 
-# Requires Administrator
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigFile = Join-Path $ScriptDir "tailscale-ports.json"
+$ProxyScript = Join-Path $ScriptDir "tailscale-proxy.js"
+
 function Test-IsAdmin {
     $currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -19,46 +22,46 @@ function Test-IsAdmin {
 
 function Ensure-Prerequisites {
     if (-not (Test-IsAdmin)) {
-        Write-Host "[!] Script ini butuh Administrator privileges untuk mengatur netsh & firewall." -ForegroundColor Red
+        Write-Host "[!] Script ini butuh Administrator privileges untuk konfigurasi jaringan & firewall." -ForegroundColor Red
         Write-Host "    Silakan buka PowerShell dengan 'Run as Administrator'." -ForegroundColor Yellow
         Pause
         exit 1
     }
-
-    # Pastikan Service IP Helper (iphlpsvc) aktif (Wajib untuk netsh portproxy)
-    $svc = Get-Service iphlpsvc -ErrorAction SilentlyContinue
-    if ($svc) {
-        if ($svc.Status -ne "Running") {
-            Write-Host "[*] Mengaktifkan Windows IP Helper Service (iphlpsvc)..." -ForegroundColor Cyan
-            Set-Service -Name iphlpsvc -StartupType Automatic
-            Start-Service -Name iphlpsvc
-        }
-    }
 }
 
-# Ambil IP Tailscale IPv4
-function Get-TailscaleIPv4 {
-    $ip = $null
-    # 1. Coba dari Adapter Tailscale
-    $adapter = Get-NetIPAddress -InterfaceAlias "*Tailscale*" -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($adapter) {
-        $ip = $adapter.IPAddress
-    }
-
-    # 2. Fallback ke tailscale CLI
-    if (-not $ip) {
+function Get-ConfiguredPorts {
+    if (Test-Path $ConfigFile) {
         try {
-            $cliOut = & tailscale ip -4 2>$null
-            if ($LASTEXITCODE -eq 0 -and $cliOut) {
-                $ip = $cliOut.Trim()
+            $content = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+            if ($content -is [array]) {
+                return [int[]]$content
             }
         } catch {}
     }
+    return @()
+}
 
+function Save-ConfiguredPorts {
+    param([int[]]$ports)
+    $unique = $ports | Sort-Object -Unique
+    $json = $unique | ConvertTo-Json
+    Set-Content -Path $ConfigFile -Value $json -Encoding utf8
+}
+
+function Get-TailscaleIPv4 {
+    $ip = $null
+    $adapter = Get-NetIPAddress -InterfaceAlias "*Tailscale*" -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($adapter) { $ip = $adapter.IPAddress }
+
+    if (-not $ip) {
+        try {
+            $cliOut = & tailscale ip -4 2>$null
+            if ($LASTEXITCODE -eq 0 -and $cliOut) { $ip = $cliOut.Trim() }
+        } catch {}
+    }
     return $ip
 }
 
-# Ambil Public IP (untuk audit verifikasi)
 function Get-PublicIPv4 {
     try {
         $resp = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 3 -ErrorAction SilentlyContinue
@@ -68,36 +71,60 @@ function Get-PublicIPv4 {
     }
 }
 
-# Parse active portproxy rules
-function Get-ActivePortProxies {
-    $output = netsh interface portproxy show v4tov4
-    $rules = @()
-    $parsing = $false
-
-    foreach ($line in $output) {
-        if ($line -match "^\s*Address\s+Port\s+Address\s+Port") {
-            $parsing = $true
-            continue
-        }
-        if ($parsing -and $line -match "^-+") {
-            continue
-        }
-        if ($parsing -and $line.Trim() -ne "") {
-            $parts = $line.Trim() -split "\s+"
-            if ($parts.Count -ge 4) {
-                $rules += [PSCustomObject]@{
-                    ListenAddress  = $parts[0]
-                    ListenPort     = [int]$parts[1]
-                    ConnectAddress = $parts[2]
-                    ConnectPort    = [int]$parts[3]
-                }
+function Cleanup-NetshRules {
+    Write-Host "[*] Membersihkan rule netsh portproxy lama (agar tidak bocor di 0.0.0.0)..." -ForegroundColor Yellow
+    $rules = netsh interface portproxy show v4tov4
+    foreach ($line in $rules) {
+        if ($line -match "^\s*(\S+)\s+(\d+)\s+(\S+)\s+(\d+)") {
+            $lAddr = $matches[1]
+            $lPort = $matches[2]
+            if ($lAddr -notmatch "Address") {
+                netsh interface portproxy delete v4tov4 listenaddress=$lAddr listenport=$lPort 2>$null
             }
         }
     }
-    return $rules
+    Write-Host "[+] Semua rule netsh portproxy lama telah dibersihkan." -ForegroundColor Green
 }
 
-# 1. List Port & Audit Keamanan
+function Get-ProxyProcess {
+    return Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%tailscale-proxy.js%'" -ErrorAction SilentlyContinue
+}
+
+function Stop-ProxyService {
+    $procs = Get-ProxyProcess
+    if ($procs) {
+        Write-Host "[*] Menghentikan Secure Proxy..." -ForegroundColor Cyan
+        foreach ($p in $procs) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+        Write-Host "[+] Secure Proxy dihentikan." -ForegroundColor Green
+    }
+}
+
+function Start-ProxyService {
+    param([int[]]$ports)
+
+    Stop-ProxyService
+    if ($ports.Count -eq 0) { return }
+
+    $portArgs = $ports -join " "
+    Write-Host "[*] Menjalankan Secure Proxy untuk port: $portArgs..." -ForegroundColor Cyan
+
+    $proc = Start-Process -FilePath "node" `
+        -ArgumentList "`"$ProxyScript`" $portArgs" `
+        -WindowStyle Hidden `
+        -PassThru
+
+    Start-Sleep -Seconds 1
+    if ($proc -and -not $proc.HasExited) {
+        Write-Host "[+] Secure Proxy aktif di background (PID: $($proc.Id))." -ForegroundColor Green
+    } else {
+        Write-Host "[!] Gagal menjalankan proxy di background. Coba jalankan secara manual: node tailscale-proxy.js $portArgs" -ForegroundColor Red
+    }
+}
+
+# 1. List Port & Status
 function Show-PortList {
     param([string]$tsIP)
 
@@ -105,46 +132,35 @@ function Show-PortList {
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host "        DAFTAR PORT PROXY & STATUS KEAMANAN" -ForegroundColor Cyan
     Write-Host "==========================================================" -ForegroundColor Cyan
-    Write-Host "Tailscale IP : $(if ($tsIP) { $tsIP } else { 'TIDAK TERDETEKSI' })" -ForegroundColor Yellow
+    Write-Host "Tailscale IP   : $(if ($tsIP) { $tsIP } else { 'TIDAK TERDETEKSI' })" -ForegroundColor Yellow
+
+    $procs = Get-ProxyProcess
+    $proxyStatus = if ($procs) { "RUNNING (PID: $(($procs | Select-Object -ExpandProperty ProcessId) -join ', '))" } else { "STOPPED" }
+    Write-Host "Proxy Service  : $proxyStatus" -ForegroundColor $(if ($procs) { "Green" } else { "Red" })
     Write-Host ""
 
-    $rules = Get-ActivePortProxies
-
-    if ($rules.Count -eq 0) {
-        Write-Host "Belum ada PortProxy yang terdaftar." -ForegroundColor Gray
+    $ports = Get-ConfiguredPorts
+    if ($ports.Count -eq 0) {
+        Write-Host "Belum ada port yang dikonfigurasi." -ForegroundColor Gray
     } else {
         $report = @()
-        foreach ($r in $rules) {
-            $localListen = Get-NetTCPConnection -LocalPort $r.ConnectPort -State Listen -ErrorAction SilentlyContinue
-            $chromeStatus = "Not Running"
-            $safety = "OK (Isolated)"
+        foreach ($p in $ports) {
+            $localListen = Get-NetTCPConnection -LocalPort $p -LocalAddress "127.0.0.1" -State Listen -ErrorAction SilentlyContinue
+            $tsListen = if ($tsIP) { Get-NetTCPConnection -LocalPort $p -LocalAddress $tsIP -State Listen -ErrorAction SilentlyContinue } else { $null }
+            $wildcardListen = Get-NetTCPConnection -LocalPort $p -LocalAddress "0.0.0.0" -State Listen -ErrorAction SilentlyContinue
 
-            if ($localListen) {
-                $boundAddrs = ($localListen | Select-Object -ExpandProperty LocalAddress) -join ", "
-                if ($boundAddrs -contains "0.0.0.0") {
-                    $chromeStatus = "Running"
-                    $safety = "DANGER! (0.0.0.0)"
-                } elseif ($boundAddrs -contains "127.0.0.1") {
-                    $chromeStatus = "Running (127.0.0.1)"
-                    $safety = "SECURE (Tailscale Only)"
-                } else {
-                    $chromeStatus = "Running ($boundAddrs)"
-                    $safety = "CUSTOM"
-                }
+            $safety = "SECURE (Tailscale Only)"
+            if ($wildcardListen) {
+                $safety = "DANGER (0.0.0.0 active!)"
             }
-
-            # Cek apakah ListenAddress sesuai dengan IP Tailscale
-            $targetMatch = if ($r.ListenAddress -eq $tsIP) { "MATCH ($tsIP)" } else { "MISMATCH ($($r.ListenAddress))" }
 
             $report += [PSCustomObject]@{
-                "Port"           = $r.ListenPort
-                "Listen IP"      = $r.ListenAddress
-                "Target Forward" = "$($r.ConnectAddress):$($r.ConnectPort)"
-                "Chrome Status"  = $chromeStatus
-                "Security Check" = $safety
+                "Port"              = $p
+                "Chrome Local"      = if ($localListen) { "Running (127.0.0.1)" } else { "Not Running" }
+                "Tailscale Listener"= if ($tsListen) { "Active ($tsIP)" } else { "Inactive" }
+                "Security Status"   = $safety
             }
         }
-
         $report | Format-Table -AutoSize
     }
 
@@ -153,12 +169,12 @@ function Show-PortList {
     [void][System.Console]::ReadKey($true)
 }
 
-# 2. Add Port to Tailscale
+# 2. Add Port
 function Add-PortProxyRule {
     param([string]$tsIP)
 
     if (-not $tsIP) {
-        Write-Host "[!] Tailscale IP tidak terdeteksi. Pastikan Tailscale sudah login dan aktif." -ForegroundColor Red
+        Write-Host "[!] Tailscale IP tidak terdeteksi. Pastikan Tailscale sudah aktif." -ForegroundColor Red
         Pause
         return
     }
@@ -167,29 +183,20 @@ function Add-PortProxyRule {
     $portInput = Read-Host "Masukkan Port CDP yang ingin dibuka ke Tailscale (contoh: 9222)"
     $port = 0
     if (-not [int]::TryParse($portInput, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
-        Write-Host "[!] Port tidak valid. Harus angka antara 1 - 65535." -ForegroundColor Red
+        Write-Host "[!] Port tidak valid." -ForegroundColor Red
         Start-Sleep -Seconds 2
         return
     }
 
-    Write-Host "`n[*] Menyiapkan Windows IP Helper Service..." -ForegroundColor Cyan
-    Set-Service -Name iphlpsvc -StartupType Automatic -ErrorAction SilentlyContinue
-    Start-Service -Name iphlpsvc -ErrorAction SilentlyContinue
+    $ports = Get-ConfiguredPorts
+    if ($ports -notcontains $port) {
+        $ports += $port
+        Save-ConfiguredPorts $ports
+    }
 
-    Write-Host "[*] Menghapus rule portproxy lama jika ada..." -ForegroundColor Cyan
-    netsh interface portproxy delete v4tov4 listenaddress=$tsIP listenport=$port 2>$null
-    netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
-
-    Write-Host "[*] Menambahkan PortProxy netsh (0.0.0.0 : $port -> 127.0.0.1 : $port)..." -ForegroundColor Cyan
-    netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$port connectaddress=127.0.0.1 connectport=$port
-
-    Write-Host "[*] Mengonfigurasi Windows Firewall (HANYA izinkan dari Tailscale Subnet 100.64.0.0/10)..." -ForegroundColor Cyan
+    # Buka firewall khusus untuk Tailscale Subnet
     $ruleName = "Tailscale-CDP-$port"
-    
-    # Hapus rule lama jika ada
     Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-
-    # Buat rule baru spesifik ke Tailscale Subnet (100.64.0.0/10)
     New-NetFirewallRule `
         -DisplayName $ruleName `
         -Description "Allow CDP access via Tailscale only for port $port" `
@@ -200,20 +207,23 @@ function Add-PortProxyRule {
         -Action Allow `
         -Profile Any | Out-Null
 
-    Write-Host "`n[+] BERHASIL: Port $port telah aktif untuk Tailscale IP ($tsIP)." -ForegroundColor Green
+    # Restart proxy dengan port baru
+    Start-ProxyService -ports $ports
+
+    Write-Host "`n[+] BERHASIL: Port $port telah di-bind ke $tsIP:$port." -ForegroundColor Green
     Write-Host "    Akses dari device lain di Tailscale: http://${tsIP}:${port}" -ForegroundColor Yellow
-    Write-Host "    Keamanan: Firewall Windows memblokir semua request dari luar Tailscale (Public IP AMAN)." -ForegroundColor Green
+    Write-Host "    Public IP terisolasi total (0% leak)." -ForegroundColor Green
     Write-Host ""
     Pause
 }
 
-# 3. Remove Port from Tailscale
+# 3. Remove Port
 function Remove-PortProxyRule {
     param([string]$tsIP)
 
-    $rules = Get-ActivePortProxies
-    if ($rules.Count -eq 0) {
-        Write-Host "[i] Tidak ada port proxy yang terdaftar." -ForegroundColor Yellow
+    $ports = Get-ConfiguredPorts
+    if ($ports.Count -eq 0) {
+        Write-Host "[i] Tidak ada port yang terdaftar." -ForegroundColor Yellow
         Pause
         return
     }
@@ -227,14 +237,16 @@ function Remove-PortProxyRule {
         return
     }
 
-    Write-Host "`n[*] Menghapus PortProxy netsh..." -ForegroundColor Cyan
-    if ($tsIP) {
-        netsh interface portproxy delete v4tov4 listenaddress=$tsIP listenport=$port 2>$null
-    }
-    netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
-    netsh interface portproxy delete v4tov4 listenaddress=* listenport=$port 2>$null
-    Write-Host "[*] Menghapus Windows Firewall Rule..." -ForegroundColor Cyan
+    $ports = $ports | Where-Object { $_ -ne $port }
+    Save-ConfiguredPorts $ports
+
     Remove-NetFirewallRule -DisplayName "Tailscale-CDP-$port" -ErrorAction SilentlyContinue
+
+    if ($ports.Count -gt 0) {
+        Start-ProxyService -ports $ports
+    } else {
+        Stop-ProxyService
+    }
 
     Write-Host "`n[+] BERHASIL: Port $port telah dihapus dari ekspos Tailscale." -ForegroundColor Green
     Write-Host ""
@@ -264,13 +276,11 @@ function Test-SecurityAudit {
         $resp = Invoke-RestMethod -Uri "http://127.0.0.1:${port}/json/version" -TimeoutSec 2 -ErrorAction Stop
         Write-Host " [OK]" -ForegroundColor Green
         Write-Host "   Browser: $($resp.Browser)" -ForegroundColor Gray
-        Write-Host "   User-Agent: $($resp.'User-Agent')" -ForegroundColor Gray
     } catch {
         Write-Host " [FAILED / NOT RUNNING]" -ForegroundColor Red
-        Write-Host "   Peringatan: Chrome belum dijalankan di port $port (Jalankan: node start-chrome.js default $port)" -ForegroundColor Yellow
     }
 
-    Write-Host "`n2. Testing Tailscale PortProxy (http://${tsIP}:${port})..." -NoNewline
+    Write-Host "`n2. Testing Tailscale IP Endpoint (http://${tsIP}:${port})..." -NoNewline
     if ($tsIP) {
         try {
             $respTs = Invoke-RestMethod -Uri "http://${tsIP}:${port}/json/version" -TimeoutSec 2 -ErrorAction Stop
@@ -278,29 +288,22 @@ function Test-SecurityAudit {
             Write-Host "   Berhasil diakses via Tailscale IP!" -ForegroundColor Green
         } catch {
             Write-Host " [UNREACHABLE]" -ForegroundColor Red
-            Write-Host "   Cek apakah PortProxy & Chrome sudah aktif untuk port $port." -ForegroundColor Yellow
+            Write-Host "   Pastikan Secure Proxy dan Chrome sudah aktif." -ForegroundColor Yellow
         }
-    } else {
-        Write-Host " [SKIPPED - Tailscale IP not found]" -ForegroundColor Yellow
     }
 
-    Write-Host "`n3. Testing Public IP Leakage (Pastikan TIDAK BISA diakses dari Public IP)..."
+    Write-Host "`n3. Testing Public IP Isolation (Pastikan TIDAK BISA diakses dari Public IP)..."
     $publicIP = Get-PublicIPv4
     if ($publicIP) {
         Write-Host "   Public IP terdeteksi: $publicIP" -ForegroundColor Gray
-        Write-Host "   Mengecek listener socket..." -NoNewline
-        $leak = Get-NetTCPConnection -LocalPort $port -LocalAddress $publicIP -State Listen -ErrorAction SilentlyContinue
         $wildcard = Get-NetTCPConnection -LocalPort $port -LocalAddress "0.0.0.0" -State Listen -ErrorAction SilentlyContinue
-        
-        if ($leak -or $wildcard) {
-            Write-Host " [CRITICAL WARNING]" -ForegroundColor Red
-            Write-Host "   BAHAYA: Port $port terbuka ke 0.0.0.0 atau Public IP!" -ForegroundColor Red
+        $pubListen = Get-NetTCPConnection -LocalPort $port -LocalAddress $publicIP -State Listen -ErrorAction SilentlyContinue
+
+        if ($wildcard -or $pubListen) {
+            Write-Host "   [!] PERINGATAN: Socket 0.0.0.0 masih aktif! Pilih opsi 'Purge netsh rules' di menu utama." -ForegroundColor Red
         } else {
-            Write-Host " [SECURE]" -ForegroundColor Green
-            Write-Host "   Port $port TIDAK listen di Public IP / 0.0.0.0." -ForegroundColor Green
+            Write-Host "   [+] AMAN: Socket hanya terikat ke Tailscale IP ($tsIP). Public IP tidak listening." -ForegroundColor Green
         }
-    } else {
-        Write-Host "   Tidak dapat mendeteksi Public IP (offline / rate limit)." -ForegroundColor Yellow
     }
 
     Write-Host ""
@@ -337,31 +340,49 @@ Ensure-Prerequisites
 
 while ($true) {
     $tsIP = Get-TailscaleIPv4
+    $procs = Get-ProxyProcess
 
     Clear-Host
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host "       CHROME CDP TAILSCALE MANAGER (WINDOWS)" -ForegroundColor Cyan
     Write-Host "==========================================================" -ForegroundColor Cyan
-    Write-Host "Status Tailscale IP : $(if ($tsIP) { "$tsIP" } else { "TIDAK AKTIF / BELUM LOGIN" })" -ForegroundColor $(if ($tsIP) { "Green" } else { "Red" })
-    Write-Host "Keamanan            : Isolasi Localhost + Tailscale Subnet" -ForegroundColor Gray
+    Write-Host "Tailscale IP   : $(if ($tsIP) { "$tsIP" } else { "TIDAK AKTIF / BELUM LOGIN" })" -ForegroundColor $(if ($tsIP) { "Green" } else { "Red" })
+    Write-Host "Proxy Engine   : Node.js Secure TCP Proxy (Strict Tailscale Bind)" -ForegroundColor Gray
+    Write-Host "Proxy Status   : $(if ($procs) { "RUNNING" } else { "STOPPED" })" -ForegroundColor $(if ($procs) { "Green" } else { "Red" })
     Write-Host "----------------------------------------------------------" -ForegroundColor Cyan
     Write-Host " 1. List Port & Status Keamanan" -ForegroundColor White
-    Write-Host " 2. Add Port to Tailscale (PortProxy + Firewall)" -ForegroundColor White
+    Write-Host " 2. Add Port to Tailscale (Proxy + Firewall)" -ForegroundColor White
     Write-Host " 3. Remove Port from Tailscale" -ForegroundColor White
     Write-Host " 4. Diagnostik & Test Endpoint (/json/version)" -ForegroundColor White
-    Write-Host " 5. Jalankan Chrome Instance (Helper)" -ForegroundColor White
-    Write-Host " 6. Keluar" -ForegroundColor White
+    Write-Host " 5. Restart / Start Secure Proxy Service" -ForegroundColor White
+    Write-Host " 6. Stop Secure Proxy Service" -ForegroundColor White
+    Write-Host " 7. Purge Old netsh 0.0.0.0 Rules (Fix Public Leak)" -ForegroundColor Yellow
+    Write-Host " 8. Jalankan Chrome Instance (Helper)" -ForegroundColor White
+    Write-Host " 9. Keluar" -ForegroundColor White
     Write-Host "==========================================================" -ForegroundColor Cyan
 
-    $choice = Read-Host "Pilih opsi [1-6]"
+    $choice = Read-Host "Pilih opsi [1-9]"
 
     switch ($choice) {
         "1" { Show-PortList -tsIP $tsIP }
         "2" { Add-PortProxyRule -tsIP $tsIP }
         "3" { Remove-PortProxyRule -tsIP $tsIP }
         "4" { Test-SecurityAudit -tsIP $tsIP }
-        "5" { Start-ChromeHelper }
+        "5" { 
+            $ports = Get-ConfiguredPorts
+            Start-ProxyService -ports $ports
+            Pause
+        }
         "6" { 
+            Stop-ProxyService
+            Pause
+        }
+        "7" { 
+            Cleanup-NetshRules
+            Pause
+        }
+        "8" { Start-ChromeHelper }
+        "9" { 
             Write-Host "`nSampai jumpa!" -ForegroundColor Cyan
             exit 0 
         }

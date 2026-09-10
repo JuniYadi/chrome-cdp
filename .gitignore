@@ -1,3 +1,4 @@
 profiles/
 docs/
 node_modules/
+tailscale-ports.json
