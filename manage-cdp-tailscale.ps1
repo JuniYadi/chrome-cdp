@@ -17,12 +17,22 @@ function Test-IsAdmin {
     return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Ensure-Admin {
+function Ensure-Prerequisites {
     if (-not (Test-IsAdmin)) {
         Write-Host "[!] Script ini butuh Administrator privileges untuk mengatur netsh & firewall." -ForegroundColor Red
         Write-Host "    Silakan buka PowerShell dengan 'Run as Administrator'." -ForegroundColor Yellow
         Pause
         exit 1
+    }
+
+    # Pastikan Service IP Helper (iphlpsvc) aktif (Wajib untuk netsh portproxy)
+    $svc = Get-Service iphlpsvc -ErrorAction SilentlyContinue
+    if ($svc) {
+        if ($svc.Status -ne "Running") {
+            Write-Host "[*] Mengaktifkan Windows IP Helper Service (iphlpsvc)..." -ForegroundColor Cyan
+            Set-Service -Name iphlpsvc -StartupType Automatic
+            Start-Service -Name iphlpsvc
+        }
     }
 }
 
@@ -162,17 +172,24 @@ function Add-PortProxyRule {
         return
     }
 
-    Write-Host "`n[*] Menambahkan PortProxy netsh ($tsIP : $port -> 127.0.0.1 : $port)..." -ForegroundColor Cyan
-    # Tambah portproxy
-    netsh interface portproxy add v4tov4 listenaddress=$tsIP listenport=$port connectaddress=127.0.0.1 connectport=$port
+    Write-Host "`n[*] Menyiapkan Windows IP Helper Service..." -ForegroundColor Cyan
+    Set-Service -Name iphlpsvc -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service -Name iphlpsvc -ErrorAction SilentlyContinue
 
-    Write-Host "[*] Mengonfigurasi Windows Firewall (Inbound Allow dari Tailscale Subnet 100.64.0.0/10)..." -ForegroundColor Cyan
+    Write-Host "[*] Menghapus rule portproxy lama jika ada..." -ForegroundColor Cyan
+    netsh interface portproxy delete v4tov4 listenaddress=$tsIP listenport=$port 2>$null
+    netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
+
+    Write-Host "[*] Menambahkan PortProxy netsh (0.0.0.0 : $port -> 127.0.0.1 : $port)..." -ForegroundColor Cyan
+    netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$port connectaddress=127.0.0.1 connectport=$port
+
+    Write-Host "[*] Mengonfigurasi Windows Firewall (HANYA izinkan dari Tailscale Subnet 100.64.0.0/10)..." -ForegroundColor Cyan
     $ruleName = "Tailscale-CDP-$port"
     
     # Hapus rule lama jika ada
     Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 
-    # Buat rule baru spesifik ke Tailscale IP / Subnet
+    # Buat rule baru spesifik ke Tailscale Subnet (100.64.0.0/10)
     New-NetFirewallRule `
         -DisplayName $ruleName `
         -Description "Allow CDP access via Tailscale only for port $port" `
@@ -183,9 +200,9 @@ function Add-PortProxyRule {
         -Action Allow `
         -Profile Any | Out-Null
 
-    Write-Host "`n[+] BERHASIL: Port $port telah di-expose ke Tailscale IP ($tsIP)." -ForegroundColor Green
+    Write-Host "`n[+] BERHASIL: Port $port telah aktif untuk Tailscale IP ($tsIP)." -ForegroundColor Green
     Write-Host "    Akses dari device lain di Tailscale: http://${tsIP}:${port}" -ForegroundColor Yellow
-    Write-Host "    Public IP tetap AMAN & TERTUTUP." -ForegroundColor Green
+    Write-Host "    Keamanan: Firewall Windows memblokir semua request dari luar Tailscale (Public IP AMAN)." -ForegroundColor Green
     Write-Host ""
     Pause
 }
@@ -212,12 +229,10 @@ function Remove-PortProxyRule {
 
     Write-Host "`n[*] Menghapus PortProxy netsh..." -ForegroundColor Cyan
     if ($tsIP) {
-        netsh interface portproxy delete v4tov4 listenaddress=$tsIP listenport=$port
+        netsh interface portproxy delete v4tov4 listenaddress=$tsIP listenport=$port 2>$null
     }
-    # Coba hapus juga wildcard/0.0.0.0 jika sempat salah setting
-    netsh interface portproxy delete v4tov4 listenaddress=* listenport=$port 2>$null
     netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
-
+    netsh interface portproxy delete v4tov4 listenaddress=* listenport=$port 2>$null
     Write-Host "[*] Menghapus Windows Firewall Rule..." -ForegroundColor Cyan
     Remove-NetFirewallRule -DisplayName "Tailscale-CDP-$port" -ErrorAction SilentlyContinue
 
@@ -318,7 +333,7 @@ function Start-ChromeHelper {
 }
 
 # Main Interactive Loop
-Ensure-Admin
+Ensure-Prerequisites
 
 while ($true) {
     $tsIP = Get-TailscaleIPv4
